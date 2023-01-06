@@ -1,0 +1,35 @@
+[tool.poetry]
+name = "instancenorm-nvfuser-py"
+version = "0.1.0"
+description = "Demo using NVFuser to create an InstanceNorm PyTorch class"
+authors = ["Jacob Hinkle <jhinkle@nvidia.com>"]
+readme = "README.md"
+packages = [{include = "pynvfinstnorm"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.tox]
+legacy_tox_ini = """
+[tox]
+envlist = mypy, py310
+isolated_build = false
+
+[testenv]
+deps =
+    pytest
+commands =
+    pytest {posargs}
+
+[testenv:mypy]
+deps =
+    mypy
+commands =
+    mypy --strict --no-incremental -p pynvfinstnorm
+    mypy --strict --no-incremental -p test
+"""
