@@ -155,12 +155,11 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
         channels_last = x.is_contiguous(
             memory_format=torch.channels_last
         ) or x.is_contiguous(memory_format=torch.channels_last_3d)
+        xorig = x
         if channels_last:
             order = [0] + [i for i in range(2, len(x.shape))] + [1]
-            _input = x.permute(order)
-        else:
-            _input = x
-        assert _input.is_contiguous()
+            x = x.permute(order)
+        assert x.is_contiguous()
 
         # execute fusion using Python API. Will be cached automatically
         fs = Fusion()
@@ -229,18 +228,16 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
         ctx.eps = eps
         ctx.channels_last = channels_last
         # saving for backward in "explicit channels-last format"
-        ctx.save_for_backward(_input, weight, running_mean, running_var, mean, invstd)
+        ctx.save_for_backward(x, weight, running_mean, running_var, mean, invstd)
         if channels_last:
-            order = [0, len(_input.shape) - 1] + [
-                i for i in range(1, len(_input.shape) - 1)
-            ]
+            order = [0, len(x.shape) - 1] + [i for i in range(1, len(x.shape) - 1)]
             out = out.permute(order)
             if len(out.shape) == 4:
                 assert out.is_contiguous(memory_format=torch.channels_last)
-                assert input.is_contiguous(memory_format=torch.channels_last)
+                assert xorig.is_contiguous(memory_format=torch.channels_last)
             elif len(out.shape) == 5:
                 assert out.is_contiguous(memory_format=torch.channels_last_3d)
-                assert input.is_contiguous(memory_format=torch.channels_last_3d)
+                assert xorig.is_contiguous(memory_format=torch.channels_last_3d)
             else:
                 assert False, "unhandled channels_last format variation in forward"
         return out
