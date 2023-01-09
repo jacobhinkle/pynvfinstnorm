@@ -62,9 +62,9 @@ def instance_norm(
     x_broadcast_mask = [axis in x_reduction_axes for axis in range(kNumberOfDims)]
     B = fd.define_constant(extent[kBatchDim])
 
-    channels_only_broadcast_mask = [
-        axis != kChannelsDim for axis in range(kNumberOfDims)
-    ]
+    # channels_only_broadcast_mask = [
+    #    axis != kChannelsDim for axis in range(kNumberOfDims)
+    # ]
 
     y = None
     mean = None
@@ -73,22 +73,16 @@ def instance_norm(
         # In NVFuser Python we pass correction=1 to request unbiased variance calculation
         x_var, x_mean = fd.ops.var_mean(x, x_reduction_axes, 1)
         if running_mean is not None and running_var is not None:
-            rev_momentum = fd.ops.sub(fd.define_constant(1.0), momentum)
+            one = fd.define_constant(1.0)
+            rev_momentum = fd.ops.sub(one, momentum)
             # do running mean with momentum
             current_mean_hat = fd.ops.mul(x_mean, momentum)
             mean_hat = fd.ops.mul(running_mean, rev_momentum)
             new_mean_hat = fd.ops.add(mean_hat, current_mean_hat)
-            """
-              if (running_mean->getDataType().value() == DataType::Half ||
-                  running_mean->getDataType().value() == DataType::BFloat16) {
-                new_mean_channels_only =
-                    castOp(running_mean->getDataType().value(), new_mean_channels_only);
-              }
-            """
             new_mean_sum = fd.ops.sum(new_mean_hat, [kBatchDim])
             rB = fd.ops.reciprocal(B)
             new_mean_channels_only = fd.ops.mul(new_mean_sum, rB)
-            # TODO: cast new_mean_channels_only to type of running_mean
+            # TODO: cast new_mean_channels_only to type of running_mean if it's half or bfloat16
 
             # TODO: is this a sufficient alternative to aliasOutputToInput?
             running_mean = new_mean_channels_only
@@ -105,33 +99,26 @@ def instance_norm(
             running_var = new_var_channels_only
 
         mean = x_mean
-        mean_bcast = fd.ops.broadcast(mean, x_broadcast_mask)
+        mean_bcast = fd.ops.broadcast_in_dim(mean, extent, [kBatchDim, kChannelsDim])
         x_sub_mean = fd.ops.sub(x, mean_bcast)
 
         var_eps = fd.ops.add(x_var, eps)
         invstd = fd.ops.rsqrt(var_eps)
-        invstd_bcast = fd.ops.broadcast(invstd, x_broadcast_mask)
+        invstd_bcast = fd.ops.broadcast_in_dim(
+            invstd, extent, [kBatchDim, kChannelsDim]
+        )
 
         y = fd.ops.mul(x_sub_mean, invstd_bcast)
 
     else:  # This is inference mode with running stats
-        """
-        } else {
-          // This is inference mode with running stats
-          auto r_mean_bcasted = broadcast(running_mean, channels_only_broadcast_mask);
-          auto x_sub_mean = sub(x, r_mean_bcasted);
-
-          auto var_eps = add(running_var, eps);
-          auto unbiased_invstd = rsqrt(var_eps);
-          auto invstd_bcast =
-              broadcast(unbiased_invstd, channels_only_broadcast_mask);
-        """
-        r_mean_bcasted = fd.ops.broadcast(running_mean, channels_only_broadcast_mask)
+        r_mean_bcasted = fd.ops.broadcast_in_dim(running_mean, extent, [kChannelsDim])
         x_sub_mean = fd.ops.sub(x, r_mean_bcasted)
 
         var_eps = fd.ops.add(running_var, eps)
         unbiased_invstd = fd.ops.rsqrt(var_eps)
-        invstd_bcast = fd.ops.broadcast(unbiased_invstd, channels_only_broadcast_mask)
+        invstd_bcasted = fd.ops.broadcast_in_dim(
+            unbiased_invstd, extent, [kChannelsDim]
+        )
 
         # During inference, mean/invstd output are empty tensors
         # on CPU, but not on CUDA. We need to make sure we have the same
@@ -141,10 +128,10 @@ def instance_norm(
         y = fd.ops.mul(x_sub_mean, invstd_bcast)
 
     if weight is not None:
-        weight_bcast = fd.ops.broadcast(weight, channels_only_broadcast_mask)
+        weight_bcast = fd.ops.broadcast_in_dim(weight, extent, [])
         y = fd.ops.mul(y, weight_bcast)
     if bias is not None:
-        bias_bcast = fd.ops.broadcast(bias, channels_only_broadcast_mask)
+        bias_bcast = fd.ops.broadcast_in_dim(bias, extent, [])
         y = fd.ops.mul(y, bias_bcast)
 
     return y, mean, invstd
@@ -175,8 +162,7 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
 
         # execute fusion using Python API. Will be cached automatically
         fs = Fusion()
-        fd = FusionDefinition(fs)
-        with fd:
+        with FusionDefinition(fs) as fd:
             tv_x = fd.define_tensor(x.ndim, torch2datatype(x.dtype))
             if weight is not None:
                 assert bias is not None
@@ -202,10 +188,10 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
                 if running_mean.dtype in [torch.half, torch.bfloat16]:
                     tv_running_mean = fd.ops.castOp(DataType.Float, tv_running_mean)
                 if running_var.dtype in [torch.half, torch.bfloat16]:
-                    tv_running_var = fd.ops.castOp(DataType.Float, tv_running_var)
+                    tv_running_var = fd.ops.castOp(tv_running_var, tv_running_var)
 
-            s_momentum = fd.define_scalar(DataType.Float)
-            s_eps = fd.define_scalar(DataType.Float)
+            s_momentum = fd.define_scalar(DataType.Double)
+            s_eps = fd.define_scalar(DataType.Double)
             inputs.extend([momentum, eps])
 
             # cast inputs if necessary
@@ -216,9 +202,6 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
             if bias is not None and bias.dtype in [torch.half, torch.bfloat16]:
                 tv_bias = fd.ops.castOp(DataType.Float, tv_bias)
 
-            # TODO: implement instance_norm here using primitives from fd.ops,
-            # instead of the built-in instance_norm which is not exposed in the
-            # Python frontend
             out, mean, invstd = instance_norm(
                 fd,
                 tv_x,
@@ -236,7 +219,7 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
             fd.add_output(out)
             fd.add_output(mean)
             fd.add_output(invstd)
-        out, mean, invstd = fs.execute(inputs)[0]
+        out, mean, invstd = fs.execute(inputs)
 
         ctx.use_input_stats = use_input_stats
         ctx.eps = eps
