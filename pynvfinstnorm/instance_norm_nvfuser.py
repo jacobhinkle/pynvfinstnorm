@@ -39,6 +39,7 @@ def instance_norm(
     momentum: Scalar,
     eps: Scalar,
     channels_last: bool,
+    unbiased: bool,
     extent: torch.Size,
 ) -> Tensor:
     """Compute instance norm layer forward for arbitrary dimensional input.
@@ -71,7 +72,7 @@ def instance_norm(
     invstd = None
     if use_input_stats or running_mean is None:
         # In NVFuser Python we pass correction=1 to request unbiased variance calculation
-        x_var, x_mean = fd.ops.var_mean(x, x_reduction_axes, 1)
+        x_var, x_mean = fd.ops.var_mean(x, x_reduction_axes, int(unbiased))
         if running_mean is not None and running_var is not None:
             one = fd.define_constant(1.0)
             rev_momentum = fd.ops.sub(one, momentum)
@@ -149,6 +150,7 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
         use_input_stats: bool,
         momentum: float,
         eps: float,
+        unbiased: bool = False,
     ) -> torch.Tensor:
         channels_last = x.is_contiguous(
             memory_format=torch.channels_last
@@ -164,14 +166,15 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
         fs = Fusion()
         with FusionDefinition(fs) as fd:
             tv_x = fd.define_tensor(x.ndim, torch2datatype(x.dtype))
+            inputs = [x]
             if weight is not None:
                 assert bias is not None
                 tv_weight = fd.define_tensor(weight.ndim, torch2datatype(weight.dtype))
                 tv_bias = fd.define_tensor(bias.ndim, torch2datatype(bias.dtype))
+                inputs.extend([weight, bias])
             else:
                 tv_weight = None
                 tv_bias = None
-            inputs = [x, weight, bias]
 
             if running_mean is None:
                 tv_running_mean = None
@@ -213,6 +216,7 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
                 s_momentum,
                 s_eps,
                 channels_last,
+                unbiased=unbiased,
                 extent=x.shape,
             )
 
@@ -295,7 +299,6 @@ class _InstanceNormNVFuser(_NormBase):
         super(_InstanceNormNVFuser, self).__init__(
             num_features, eps, momentum, affine, track_running_stats, **factory_kwargs
         )
-        self.dummy = torch.empty([], device=device)
 
     def _check_input_dim(self, input):
         raise NotImplementedError
@@ -351,28 +354,16 @@ class _InstanceNormNVFuser(_NormBase):
     def forward(self, input: Tensor) -> Tensor:
         assert input.is_cuda, "NVFuser InstanceNorm is CUDA only"
         self._check_input_dim(input)
-        if self.running_mean is not None:
-            out = InstanceNormNVFuserFunction.apply(
-                input,
-                self.weight if self.weight is not None else self.dummy,
-                self.bias if self.bias is not None else self.dummy,
-                self.running_mean,
-                self.running_var,
-                self.training or not self.track_running_stats,
-                self.momentum,
-                self.eps,
-            )
-        else:
-            out = InstanceNormNVFuserFunction.apply(
-                input,
-                self.weight if self.weight is not None else self.dummy,
-                self.bias if self.bias is not None else self.dummy,
-                self.dummy,
-                self.dummy,
-                self.training or not self.track_running_stats,
-                self.momentum,
-                self.eps,
-            )
+        out = InstanceNormNVFuserFunction.apply(
+            input,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            self.training or not self.track_running_stats,
+            self.momentum,
+            self.eps,
+        )
         return out
 
 
