@@ -129,11 +129,11 @@ def instance_norm(
         y = fd.ops.mul(x_sub_mean, invstd_bcast)
 
     if weight is not None:
-        weight_bcast = fd.ops.broadcast_in_dim(weight, extent, [])
+        weight_bcast = fd.ops.broadcast_in_dim(weight, extent, [kChannelsDim])
         y = fd.ops.mul(y, weight_bcast)
     if bias is not None:
-        bias_bcast = fd.ops.broadcast_in_dim(bias, extent, [])
-        y = fd.ops.mul(y, bias_bcast)
+        bias_bcast = fd.ops.broadcast_in_dim(bias, extent, [kChannelsDim])
+        y = fd.ops.add(y, bias_bcast)
 
     return y, mean, invstd
 
