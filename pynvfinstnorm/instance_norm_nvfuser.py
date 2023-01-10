@@ -43,6 +43,7 @@ def instance_norm(
     channels_last: bool,
     unbiased: bool,
     extent: torch.Size,
+    x_datatype: DataType,
 ) -> Tensor:
     """Compute instance norm layer forward for arbitrary dimensional input.
 
@@ -59,15 +60,12 @@ def instance_norm(
     kNumberOfDims = len(extent)
     kChannelsDim = kNumberOfDims - 1 if channels_last else 1
 
+    num_features = extent.numel() // (extent[kBatchDim] * extent[kChannelsDim])
+
     x_reduction_axes = [
         axis for axis in range(kNumberOfDims) if axis not in [kBatchDim, kChannelsDim]
     ]
-    x_broadcast_mask = [axis in x_reduction_axes for axis in range(kNumberOfDims)]
     B = fd.define_constant(extent[kBatchDim])
-
-    # channels_only_broadcast_mask = [
-    #    axis != kChannelsDim for axis in range(kNumberOfDims)
-    # ]
 
     y = None
     mean = None
@@ -75,31 +73,46 @@ def instance_norm(
     if use_input_stats or running_mean is None:
         # In NVFuser Python we pass correction=1 to request unbiased variance calculation
         x_var, x_mean = fd.ops.var_mean(x, x_reduction_axes, int(unbiased))
-        if running_mean is not None and running_var is not None:
+        if running_mean is not None:
             one = fd.define_constant(1.0)
             rev_momentum = fd.ops.sub(one, momentum)
+
             # do running mean with momentum
             current_mean_hat = fd.ops.mul(x_mean, momentum)
             mean_hat = fd.ops.mul(running_mean, rev_momentum)
             new_mean_hat = fd.ops.add(mean_hat, current_mean_hat)
+
             new_mean_sum = fd.ops.sum(new_mean_hat, [kBatchDim])
             rB = fd.ops.reciprocal(B)
             new_mean_channels_only = fd.ops.mul(new_mean_sum, rB)
-            # TODO: cast new_mean_channels_only to type of running_mean if it's half or bfloat16
-
-            # TODO: is this a sufficient alternative to aliasOutputToInput?
-            running_mean = new_mean_channels_only
+            if x_datatype in [DataType.Half, DataType.BFloat16]:
+                new_mean_channels_only = fd.ops.castOp(
+                    x_datatype, new_mean_channels_only
+                )
+            fd.add_output(new_mean_channels_only, alias_input=running_mean)
 
             # running var calculation
-            current_var_hat = fd.ops.mul(x_var, momentum)
+            # For some reason, in PyTorch normalization layers, running
+            # variances are computed using unbiased estimates with
+            # normalization 1/(N-1), while the outputs are usually computed
+            # using the _biased_ variance of the current batch. Only in
+            # inference mode are the unbiased running stats used to normalize
+            # the output.
+            x_var_unbiased = x_var
+            if not unbiased:
+                # multiply by correction to go from biased to unbiased estimate
+                b2ub = fd.define_constant(num_features / (num_features - 1))
+                x_var_unbiased = fd.ops.mul(x_var, b2ub)
+
+            current_var_hat = fd.ops.mul(x_var_unbiased, momentum)
             var_hat = fd.ops.mul(running_var, rev_momentum)
             new_var_hat = fd.ops.add(var_hat, current_var_hat)
 
             new_var_sum = fd.ops.sum(new_var_hat, [kBatchDim])
-            new_var_channels_only = fd.ops.mul(new_mean_sum, rB)
-            # TODO: Alias to input running_var
-            # fd.aliasOutputToInput(new_var_channels_only, running_var)
-            running_var = new_var_channels_only
+            new_var_channels_only = fd.ops.mul(new_var_sum, rB)
+            if x_datatype in [DataType.Half, DataType.BFloat16]:
+                new_var_channels_only = fd.ops.castOp(x_datatype, new_var_channels_only)
+            fd.add_output(new_var_channels_only, alias_input=running_var)
 
         mean = x_mean
         mean_bcast = fd.ops.broadcast_in_dim(mean, extent, [kBatchDim, kChannelsDim])
@@ -118,14 +131,10 @@ def instance_norm(
         x_sub_mean = fd.ops.sub(x, r_mean_bcast)
 
         var_eps = fd.ops.add(running_var, eps)
-        unbiased_invstd = fd.ops.rsqrt(var_eps)
-        invstd_bcast = fd.ops.broadcast_in_dim(unbiased_invstd, extent, [kChannelsDim])
+        invstd = fd.ops.rsqrt(var_eps)
+        invstd_bcast = fd.ops.broadcast_in_dim(invstd, extent, [kChannelsDim])
 
-        # During inference, mean/invstd output are empty tensors
-        # on CPU, but not on CUDA. We need to make sure we have the same
-        # behavior as with eager mode on CUDA.
         mean = running_mean
-        invstd = unbiased_invstd
         y = fd.ops.mul(x_sub_mean, invstd_bcast)
 
     if weight is not None:
@@ -217,12 +226,17 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
                 channels_last,
                 unbiased=unbiased,
                 extent=x.shape,
+                x_datatype=torch2datatype(x.dtype),
             )
 
             fd.add_output(out)
             fd.add_output(mean)
             fd.add_output(invstd)
-        out, mean, invstd = fs.execute(inputs)
+        res = fs.execute(inputs)
+        if len(res) == 5:
+            res = res[:-2]
+        assert len(res) == 3
+        out, mean, invstd = res
 
         ctx.use_input_stats = use_input_stats
         ctx.eps = eps
@@ -350,25 +364,25 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
             else:
                 grad_input = fd.ops.mul(tv_grad_output, grad_scale)
 
-            x_dtype = torch2datatype(x.dtype)
-            if x_dtype in [DataType.Half, DataType.BFloat16]:
-                fd.add_output(fd.ops.castOp(x_dtype, grad_input))
+            x_datatype = torch2datatype(x.dtype)
+            if x_datatype in [DataType.Half, DataType.BFloat16]:
+                fd.add_output(fd.ops.castOp(x_datatype, grad_input))
             else:
                 fd.add_output(grad_input)
 
             if weight is not None:
                 grad_weight = fd.ops.mul(dot_p, tv_invstd)
                 grad_weight_reduced = fd.ops.sum(grad_weight, [0])
-                if x_dtype in [DataType.Half, DataType.BFloat16]:
-                    fd.add_output(fd.ops.castOp(x_dtype, grad_weight_reduced))
+                if x_datatype in [DataType.Half, DataType.BFloat16]:
+                    fd.add_output(fd.ops.castOp(x_datatype, grad_weight_reduced))
                 else:
                     fd.add_output(grad_weight_reduced)
 
             if bias is not None:
                 grad_bias = grad_output_sum
                 grad_bias_reduced = fd.ops.sum(grad_bias, [0])
-                if x_dtype in [DataType.Half, DataType.BFloat16]:
-                    fd.add_output(fd.ops.castOp(x_dtype, grad_bias_reduced))
+                if x_datatype in [DataType.Half, DataType.BFloat16]:
+                    fd.add_output(fd.ops.castOp(x_datatype, grad_bias_reduced))
                 else:
                     fd.add_output(grad_bias_reduced)
 
