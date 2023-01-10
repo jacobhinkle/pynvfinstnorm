@@ -132,6 +132,10 @@ class TestInstanceNormNVFuser(unittest.TestCase):
         for dtype, track_running_stats, channels_last, affine in itertools.product(
             dtypes, (False, True), (False, True), (False, True)
         ):
+            print(
+                f"SUBTEST ARGS: dtype={dtype} track_running_stats={track_running_stats} channels_last={channels_last} affine={affine} ",
+                end="",
+            )
             with self.subTest(
                 dtype=dtype,
                 track_running_stats=track_running_stats,
@@ -144,6 +148,7 @@ class TestInstanceNormNVFuser(unittest.TestCase):
                 self.affine = affine
                 self.init_modules()
                 self.check_same_output()
+            print(" PASS")
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "more than 1 GPU required")
     def test_multigpu(self):

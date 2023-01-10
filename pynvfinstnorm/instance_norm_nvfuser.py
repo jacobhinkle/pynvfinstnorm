@@ -6,6 +6,8 @@ from torch.nn.modules.batchnorm import _NormBase
 
 from nvfuser._C import DataType, Fusion, FusionCache, FusionDefinition, Scalar, Tensor
 
+from .nvfuser_norm import norm_fusion_forward
+
 from typing import Any, Optional, Tuple
 
 
@@ -112,14 +114,12 @@ def instance_norm(
         y = fd.ops.mul(x_sub_mean, invstd_bcast)
 
     else:  # This is inference mode with running stats
-        r_mean_bcasted = fd.ops.broadcast_in_dim(running_mean, extent, [kChannelsDim])
-        x_sub_mean = fd.ops.sub(x, r_mean_bcasted)
+        r_mean_bcast = fd.ops.broadcast_in_dim(running_mean, extent, [kChannelsDim])
+        x_sub_mean = fd.ops.sub(x, r_mean_bcast)
 
         var_eps = fd.ops.add(running_var, eps)
         unbiased_invstd = fd.ops.rsqrt(var_eps)
-        invstd_bcasted = fd.ops.broadcast_in_dim(
-            unbiased_invstd, extent, [kChannelsDim]
-        )
+        invstd_bcast = fd.ops.broadcast_in_dim(unbiased_invstd, extent, [kChannelsDim])
 
         # During inference, mean/invstd output are empty tensors
         # on CPU, but not on CUDA. We need to make sure we have the same
@@ -228,7 +228,7 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
         ctx.eps = eps
         ctx.channels_last = channels_last
         # saving for backward in "explicit channels-last format"
-        ctx.save_for_backward(x, weight, running_mean, running_var, mean, invstd)
+        ctx.save_for_backward(x, weight, bias, running_mean, running_var, mean, invstd)
         if channels_last:
             order = [0, len(x.shape) - 1] + [i for i in range(1, len(x.shape) - 1)]
             out = out.permute(order)
@@ -246,27 +246,146 @@ class InstanceNormNVFuserFunction(torch.autograd.Function):
     def backward(
         ctx: Any, grad_output: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None, None,]:
-        global instance_norm_nvfuser_cuda
-        if instance_norm_nvfuser_cuda is None:
-            instance_norm_nvfuser_cuda = importlib.import_module(
-                "instance_norm_nvfuser_cuda"
-            )
-
+        """
+        Instance norm backward using NVFuser
+        """
         if ctx.channels_last:
             order = [0] + [i for i in range(2, len(grad_output.shape))] + [1]
             grad_output = grad_output.permute(order)
         # input was saved in "explicit channels-last format"
         assert ctx.saved_tensors[0].is_contiguous()
         grad_output = grad_output.contiguous()
-        saved = list(ctx.saved_tensors)
-        saved.insert(1, grad_output)
-        running_mean = saved[3]
-        running_var = saved[4]
-        mean = saved[-2]
-        var = saved[-1]
-        grad_input, grad_weight, grad_bias = instance_norm_nvfuser_cuda.backward(
-            *saved, ctx.use_input_stats, ctx.eps, ctx.channels_last
-        )
+        x, weight, bias, running_mean, running_var, mean, invstd = ctx.saved_tensors
+
+        kBatchDim = 0
+        kNumberOfDims = x.ndim
+        kChannelsDim = kNumberOfDims - 1 if ctx.channels_last else 1
+        kTraining = ctx.use_input_stats
+        reduction_axes = [
+            axis
+            for axis in range(kNumberOfDims)
+            if axis not in [kBatchDim, kChannelsDim]
+        ]
+
+        fs = Fusion()
+        with FusionDefinition(fs) as fd:
+            tv_x = fd.define_tensor(x.ndim, torch2datatype(x.dtype))
+            inputs = [x]
+            if weight is not None:
+                tv_weight = fd.define_tensor(weight.ndim, torch2datatype(weight.dtype))
+                inputs.extend([weight])
+            else:
+                tv_weight = None
+
+            tv_grad_output = fd.define_tensor(grad_output.ndim)
+            inputs.append(grad_output)
+
+            if kTraining:
+                assert mean is not None and invstd is not None
+                tv_mean = fd.define_tensor(mean.ndim)
+                inputs.append(mean)
+                tv_invstd = fd.define_tensor(invstd.ndim)
+                inputs.append(invstd)
+            else:
+                tv_running_mean = fd.define_tensor(running_mean.ndim)
+                inputs.append(running_mean)
+                tv_running_var = fd.define_tensor(running_var.ndim)
+                inputs.append(running_var)
+                c_eps = fd.define_constant(DataType.Double, ctx.eps)
+
+                tv_mean = tv_running_mean
+                tv_invstd = fd.ops.rsqrt(fd.ops.add(tv_running_var, c_eps))
+
+            tv_mean = fd.ops.broadcast_in_dim(
+                tv_mean, x.shape, [kBatchDim, kChannelsDim]
+            )
+
+            num_features = x.numel() // (x.shape[kBatchDim] * x.shape[kChannelsDim])
+
+            norm = fd.define_constant(1.0 / num_features)
+            grad_output_sum = fd.ops.sum(tv_grad_output, reduction_axes)
+            dot_p = fd.ops.sum(
+                fd.ops.mul(
+                    tv_grad_output,
+                    fd.ops.sub(tv_x, tv_mean),
+                ),
+                reduction_axes,
+            )
+            grad_mean = fd.ops.broadcast_in_dim(
+                fd.ops.mul(grad_output_sum, norm),
+                x.shape,
+                [kBatchDim, kChannelsDim],
+            )
+            proj_scale = fd.ops.broadcast_in_dim(
+                fd.ops.mul(
+                    fd.ops.mul(dot_p, norm),
+                    fd.ops.mul(tv_invstd, tv_invstd),
+                ),
+                x.shape,
+                [kBatchDim, kChannelsDim],
+            )
+
+            invstd_bcast = fd.ops.broadcast_in_dim(
+                tv_invstd,
+                x.shape,
+                [kBatchDim, kChannelsDim],
+            )
+            grad_scale = (
+                invstd_bcast
+                if weight is None
+                else fd.ops.mul(
+                    invstd_bcast,
+                    fd.ops.broadcast_in_dim(tv_weight, x.shape, [0]),
+                )
+            )
+            if kTraining:
+                proj = fd.ops.mul(fd.ops.sub(tv_x, tv_mean), proj_scale)
+                grad_input = fd.ops.mul(
+                    fd.ops.sub(
+                        fd.ops.sub(tv_grad_output, proj),
+                        grad_mean,
+                    ),
+                    grad_scale,
+                )
+            else:
+                grad_input = fd.ops.mul(tv_grad_output, grad_scale)
+
+            x_dtype = torch2datatype(x.dtype)
+            if x_dtype in [DataType.Half, DataType.BFloat16]:
+                fd.add_output(fd.ops.castOp(x_dtype, grad_input))
+            else:
+                fd.add_output(grad_input)
+
+            if weight is not None:
+                grad_weight = fd.ops.mul(dot_p, tv_invstd)
+                grad_weight_reduced = fd.ops.sum(grad_weight, [0])
+                if x_dtype in [DataType.Half, DataType.BFloat16]:
+                    fd.add_output(fd.ops.castOp(x_dtype, grad_weight_reduced))
+                else:
+                    fd.add_output(grad_weight_reduced)
+
+            if bias is not None:
+                grad_bias = grad_output_sum
+                grad_bias_reduced = fd.ops.sum(grad_bias, [0])
+                if x_dtype in [DataType.Half, DataType.BFloat16]:
+                    fd.add_output(fd.ops.castOp(x_dtype, grad_bias_reduced))
+                else:
+                    fd.add_output(grad_bias_reduced)
+
+        res = fs.execute(inputs)
+        grad_input = res[0]
+        c = 1
+        if weight is not None:
+            grad_weight = res[c]
+            c += 1
+        else:
+            grad_weight = None
+        if bias is not None:
+            grad_bias = res[c]
+            c += 1
+        else:
+            grad_bias = None
+
         if ctx.channels_last:
             order = [0, len(grad_input.shape) - 1] + [
                 i for i in range(1, len(grad_input.shape) - 1)
